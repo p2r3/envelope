@@ -46,8 +46,11 @@ class ZIPExtractor {
     }
   }
 
+
   extractFile (path) {
-    const fileInfo = this.files.get(path);
+    const fileInfo = this.files.get(
+      path.startsWith("./") ? path.slice(2) : path
+    );
     if (!fileInfo) throw new Error(`File not found: ${path}`);
 
     let offset = fileInfo.localHeaderOffset;

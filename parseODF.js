@@ -13,6 +13,8 @@ const parseStyle = (style) => {
   const columnProperties = getChild(style, "style:table-column-properties");
   const rowProperties = getChild(style, "style:table-row-properties");
   const cellProperties = getChild(style, "style:table-cell-properties");
+  const graphicProperties = getChild(style,"loext:graphic-properties")
+  // loext mean its not part of the spec, yet libreoffice uses that, and libreoffice is basically the spec - anything support it
 
   let css = "";
 
@@ -82,15 +84,39 @@ const parseStyle = (style) => {
     }
 
   }
+  if (graphicProperties){
+    let fillType;
+    if (fillType = graphicProperties["draw:fill"]!='none' && graphicProperties["draw:fill"]){
+      let prop;
+      // solid(draw:fill-color),gradient(draw:style),bitmap(draw:fill-image),none
+      // skip opacity for now
+      if (prop = fillType=="solid" && graphicProperties["draw:fill-color"]){
+        css+=`background-color:${prop}`
+      }
+      if (prop = fillType=="gradient" && graphicProperties["draw:style"]){
+        const startColor = graphicProperties["draw:start-color"];
+        const endColor = graphicProperties["draw:end-color"]
+        // skip intensity for now
+        if (prop === "radial") {
+            const cx = graphicProperties["draw:cx"] || 0.5;
+            const cy = graphicProperties["draw:cy"] || 0.5;
+            css+=(`background: radial-gradient(circle at ${cx * 100}% ${cy * 100}%, ${startColor}, ${endColor});`);
+        }
+        else{
+          css+=`background: linear-gradient(${startColor}, ${endColor});`
+        }
+      }
 
+    }
+
+
+  }
   return css;
-
 };
 
 const handleElement = async (element, styles, zip, layout) => {
-
-  const pageWidth = parseFloat(layout["fo:page-width"]);
-  const pageHeight = parseFloat(layout["fo:page-height"]);
+    // look at https://github.com/LibreOffice/libetonyek/blob/c3ac91b8cf6cdb83b777b480c6c000b9542f3add/src/lib/IWORKCollector.cpp#L975 for reference.
+    // they built a library to convert Apple iWork documents to open
 
   let htmlTag = element._tag.split(":").pop();
   let attributes = "";
@@ -116,10 +142,16 @@ const handleElement = async (element, styles, zip, layout) => {
     case "text:h": htmlTag = "h1"; break;
     case "text:list": htmlTag = "ul"; break;
     case "text:list-item": htmlTag = "li"; break;
+    case "text:p":
+{
+  htmlTag = "p";
+  // each paragraph that contains frames should act like new 0,0 coordinate.
+  css += "position:relative; margin:0; padding:0; min-height:1em;";
+  break;
+}
     case "table:table-column": {
-      htmlTag = "th";
-      outputBefore = "<tr>"
-      outputAfter = "</tr>";
+      htmlTag = "col";
+
       repeat = (Number(element["table:number-columns-repeated"]) || 0) - 1;
       break;
     }
@@ -128,8 +160,8 @@ const handleElement = async (element, styles, zip, layout) => {
     {
       htmlTag = "td";
       repeat = (Number(element["table:number-columns-repeated"]) || 0) - 1;
-      const rowspan = element["table:number-rows-spanned"] || 0;
-      const colspan = element["table:number-columns-spanned"] || 0;
+      const rowspan = element["table:number-rows-spanned"] || 1; // rowspan 0 does not do what you think, see https://developer.mozilla.org/en-US/docs/Web/API/HTMLTableCellElement/rowSpan
+      const colspan = element["table:number-columns-spanned"] || 1;
       attributes += ` rowspan="${rowspan}"`;
       attributes += ` colspan="${colspan}"`;
       content = `<div>${content}</div>`;
@@ -139,6 +171,7 @@ const handleElement = async (element, styles, zip, layout) => {
     {
       htmlTag = "img";
       const mime = element["draw:mime-type"];
+      if (!mime) break; // libreoffice embed objects as a VCL Metafile (VCLMTF). no support for now
       const path = element["xlink:href"];
       const base64 = zip.extractBase64(path);
       attributes += ` src="data:${mime};base64,${base64}"`;
@@ -147,19 +180,30 @@ const handleElement = async (element, styles, zip, layout) => {
     }
     case "draw:frame":
     {
+      css += "position:absolute;"; // force all frames to be absolute, without that browser might not listen to z-index
+
+      // the sizes are in inches, and displaied as "<N>in", so css are happy
+
       htmlTag = "div";
-      const width = (parseFloat(element["svg:width"]) / pageWidth * 100).toFixed(3);
-      const height = (parseFloat(element["svg:height"]) / pageHeight * 100).toFixed(3);
-      const x = element["svg:x"] && (parseFloat(element["svg:x"]) / pageWidth * 100).toFixed(3);
-      const y = element["svg:y"] && (parseFloat(element["svg:y"]) / pageHeight * 100).toFixed(3);
-      if (x || y) {
-        css += "position:absolute;";
-        if (x) css += `left:${x}%;`;
-        if (y) css += `top:${y}%;`;
-      }
-      css += `width:${width}%;height:${height}%;`;
+      const width = element["svg:width"]
+      const height = element["svg:height"]
+      const x = element["svg:x"]
+      const y = element["svg:y"]
+      const zindex = element["draw:z-index"]
+      css+=`z-index:${zindex};`
+
+      if (x) css += `left:${x||0};`;
+
+      if (y) css += `top:${y||0};`;
+      css += `width:${width};height:${height};`;
       break;
     }
+    // blacklist tags
+    case "text:sequence-decls" :
+    case "office:forms":
+      return ''
+
+
     default: break;
   }
 
@@ -204,7 +248,9 @@ const extractDocument = async (bytes, callback) => {
       if (!(className in cssClasses)) {
         cssClasses[className] = "";
       }
-      cssClasses[className] += parseStyle(element);
+      const parent = element['style:parent-style-name']
+
+      cssClasses[className] += ((cssClasses[parent] ?? '')+parseStyle(element));
     }
 
     let css = `<style>
@@ -225,6 +271,12 @@ const extractDocument = async (bytes, callback) => {
       td * {
         margin: 0;
       }
+
+    img {
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+  }
     `;
 
     for (const className in cssClasses) {
